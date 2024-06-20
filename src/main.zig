@@ -1,12 +1,10 @@
 const std = @import("std");
 const Interpreter = @import("./interpreter.zig").Interpreter;
+const bc = @import("./bc.zig");
 
-const Writer = std.fs.File.Writer;
-const Reader = std.fs.File.Reader;
-
-fn repl(out: *const Writer, in: *const Reader) !void {
+fn repl(out: *const std.fs.File.Writer, in: *const std.fs.File.Reader) !void {
     var buffer: [2048]u8 = undefined;
-    var interpreter = Interpreter.new(""[0..]);
+    var vm = Interpreter.new();
     var debug = false;
     var line_by_line = false;
     while (true) {
@@ -23,20 +21,19 @@ fn repl(out: *const Writer, in: *const Reader) !void {
         };
 
         const cmd = std.meta.stringToEnum(Command, command) orelse {
-            interpreter.program = command;
-            interpreter.ip = 0;
-            interpreter.run_to_end(out, in, debug and line_by_line) catch |err| {
+            vm.load(command);
+            vm.run_to_end(out, in, debug and line_by_line) catch |err| {
                 std.debug.print("\nError: '{}'\n", .{err});
             };
             if (debug and !line_by_line) {
-                interpreter.dump();
+                vm.dump();
             }
             continue;
         };
         switch (cmd) {
             .quit => break,
-            .reset => interpreter.reset(),
-            .dump => interpreter.dump(),
+            .reset => vm.reset(),
+            .dump => vm.dump(),
             .debug => {
                 debug = !debug;
                 std.debug.print("Debug mode is {s}\n", .{if (debug) "enabled" else "disabled" });
@@ -69,6 +66,17 @@ pub fn main() !void {
     const data = try fp.readToEndAlloc(alloc, 0xffff_ffff);
     defer alloc.free(data);
 
-    var interpreter = Interpreter.new(data[0..]);
-    return interpreter.run_to_end(&stdout, &stdin, false);
+    // var vm = Interpreter.new();
+    // vm.load(data[0..]);
+    // return vm.run_to_end(&stdout, &stdin, false);
+
+    const code = try bc.compile(data, alloc);
+    defer code.deinit();
+
+    // bc.dump_all(code.items);
+    // std.debug.print("\n\n", .{});
+
+    var vm = bc.Interpreter.new();
+    vm.load(code.items[0..]);
+    return vm.run_to_end(&stdout, &stdin, true);
 }

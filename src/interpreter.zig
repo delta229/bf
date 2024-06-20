@@ -1,133 +1,92 @@
 const std = @import("std");
+const vm = @import("./state.zig");
 
-const Writer = std.fs.File.Writer;
-const Reader = std.fs.File.Reader;
-const InterpretError = error {
-    OutOfBounds,
-    NoMatchingFJump,
-    NoMatchingRJump,
-};
+const StepError = vm.InterpretError || anyerror; //InterpretError || std.fs.File.WriteError || std.fs.File.ReadError;
 
-const NUM_CELLS = 30000;
-pub const Interpreter = struct {
-    bp: usize,
-    ip: usize,
-    data: [NUM_CELLS]u8,
-    program: []const u8,
-
-    pub fn new(program: []const u8) Interpreter {
-        return .{ .bp = 0, .ip = 0, .program = program, .data = [_]u8{0} ** NUM_CELLS };
+fn step(self: *vm.State, out: anytype, in: anytype) StepError!void {
+    if (self.ip >= self.program.len) {
+        return;
     }
 
-    pub fn run_for(
-        self: *Interpreter,
-        count: ?usize,
-        out: anytype,
-        in: anytype,
-        debug: bool,
-    ) !void {
-        var exec: usize = 0;
-        while (self.ip < self.program.len and (count == null or exec < count.?)) : (exec +|= 1) {
-            if (debug) {
-                self.dump();
+    defer self.ip += 1;
+    switch (self.program[self.ip]) {
+        '>' => self.bp += 1,
+        '<' => self.bp -= 1,
+        '+' => self.data[self.bp] +%= 1,
+        '-' => self.data[self.bp] -%= 1,
+        '.' => try out.print("{c}", .{self.data[self.bp]}),
+        ',' => self.data[self.bp] = in.readByte() catch 0,
+        '[' => {
+            if (self.data[self.bp] != 0) {
+                return;
             }
-            try self.step(out, in);
-        }
-    }
 
-    pub fn run_to_end(self: *Interpreter, out: anytype, in: anytype, dbg: bool) !void {
-        return self.run_for(null, out, in, dbg);
-    }
-
-    pub fn step(self: *Interpreter, out: anytype, in: anytype) !void {
-        if (self.ip >= self.program.len) {
-            return;
-        }
-
-        defer self.ip += 1;
-        switch (self.program[self.ip]) {
-            '>' => self.bp += 1,
-            '<' => self.bp -= 1,
-            '+' => self.data[self.bp] +%= 1,
-            '-' => self.data[self.bp] -%= 1,
-            '.' => try out.print("{c}", .{self.data[self.bp]}),
-            ',' => self.data[self.bp] = try in.readByte(),
-            '[' => {
-                if (self.data[self.bp] != 0) {
-                    return;
-                }
-
-                var count: usize = 0;
-                while (self.ip < self.program.len) : (self.ip += 1) {
-                    if (self.program[self.ip] == '[') {
-                        count += 1;
-                    } else if (self.program[self.ip] == ']') {
-                        count -= 1;
-                        if (count == 0) {
-                            return;
-                        }
+            var count: usize = 0;
+            while (self.ip < self.program.len) : (self.ip += 1) {
+                if (self.program[self.ip] == '[') {
+                    count += 1;
+                } else if (self.program[self.ip] == ']') {
+                    count -= 1;
+                    if (count == 0) {
+                        return;
                     }
                 }
-                return error.NoMatchingFJump;
-            },
-            ']' => {
-                if (self.data[self.bp] == 0) {
-                    return;
+            }
+            return vm.InterpretError.UnmatchedL;
+        },
+        ']' => {
+            if (self.data[self.bp] == 0) {
+                return;
+            }
+
+            var count: usize = 0;
+            while (true) {
+                if (self.program[self.ip] == ']') {
+                    count += 1;
+                } else if (self.program[self.ip] == '[') {
+                    count -= 1;
+                    if (count == 0) {
+                        return;
+                    }
                 }
 
-                var count: usize = 0;
-                while (true) {
-                    if (self.program[self.ip] == ']') {
-                        count += 1;
-                    } else if (self.program[self.ip] == '[') {
-                        count -= 1;
-                        if (count == 0) {
-                            return;
-                        }
-                    }
-
-                    if (self.ip == 0) {
-                        break;
-                    }
-                    self.ip -= 1;
+                if (self.ip == 0) {
+                    break;
                 }
+                self.ip -= 1;
+            }
 
-                return error.NoMatchingRJump;
-            },
-            else => {}, // BF ignores everything else
-        }
+            return vm.InterpretError.UnmatchedR;
+        },
+        else => {}, // BF ignores everything else
+    }
+}
+
+fn dump(self: *const vm.State) void {
+    if (self.ip < self.program.len) {
+        std.debug.print("-> '{c}' | ", .{self.program[self.ip]});
+    } else {
+        std.debug.print("-> EOF | ", .{});
     }
 
-    pub fn reset(self: *Interpreter) void {
-        self.bp = 0;
-        self.ip = 0;
-        @memset(&self.data, 0);
-        self.program = ""[0..];
-    }
-
-    pub fn dump(self: *const Interpreter) void {
-        if (self.ip < self.program.len) {
-            std.debug.print("-> '{c}' | ", .{self.program[self.ip]});
+    std.debug.print("IP: 0x{x:0>4} BP: 0x{x:0>4} [ ", .{ self.ip, self.bp });
+    const RANGE = 5;
+    const min = self.bp -| RANGE;
+    for (self.data[min .. self.bp + 5], min..) |byte, i| {
+        if (i == self.bp) {
+            std.debug.print("\x1b[31;1;4m0x{x:0>2}\x1b[0m ", .{byte});
         } else {
-            std.debug.print("-> EOF | ", .{});
+            std.debug.print("0x{x:0>2} ", .{byte});
         }
-
-        std.debug.print("IP: 0x{x:0>4} BP: 0x{x:0>4} [ ", .{self.ip, self.bp});
-        const RANGE = 5;
-        const min = self.bp -| RANGE;
-        for (self.data[min..self.bp + 5], min..) |byte, i| {
-            if (i == self.bp) {
-                std.debug.print("\x1b[31;1;4m0x{x:0>2}\x1b[0m ", .{byte});
-            } else {
-                std.debug.print("0x{x:0>2} ", .{byte});
-            }
-        }
-        std.debug.print("]\n", .{});
     }
-};
+    std.debug.print("]\n", .{});
+}
+
+pub const Interpreter = vm.Interpreter(StepError, ""[0..], step, dump);
 
 fn expectOutput(program: []const u8, expected: []const u8) !void {
-    var interpreter = Interpreter.new(program);
+    var interpreter = Interpreter.new();
+    interpreter.load(program);
 
     var arr = std.ArrayList(u8).init(std.testing.allocator);
     defer arr.deinit();
