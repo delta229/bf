@@ -1,4 +1,5 @@
 const std = @import("std");
+const clap = @import("clap");
 const Interpreter = @import("./interpreter.zig").Interpreter;
 const bc = @import("./bc.zig");
 
@@ -48,35 +49,64 @@ fn repl(out: *const std.fs.File.Writer, in: *const std.fs.File.Reader) !void {
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const alloc = gpa.allocator(); 
+    defer _ = gpa.deinit();
 
-    const args = try std.process.argsAlloc(std.heap.page_allocator);
-    defer std.process.argsFree(std.heap.page_allocator, args);
+    const alloc = gpa.allocator();
+    const params = comptime clap.parseParamsComptime(
+        \\-h, --help             Display this help and exit.
+        \\-n, --nobytecode       Don't use the bytecode interpreter.
+        \\-d, --debug            Enable instruction debug mode.
+        \\-p, --print            Dump bytecode instead of executing.
+        \\<str>...
+        \\
+    );
+
+    var diag = clap.Diagnostic{};
+    var res = clap.parse(clap.Help, &params, clap.parsers.default, .{
+        .diagnostic = &diag,
+        .allocator = alloc,
+    }) catch |err| {
+        // Report useful error and exit
+        diag.report(std.io.getStdErr().writer(), err) catch {};
+        return err;
+    };
+    defer res.deinit();
 
     const stdout = std.io.getStdOut().writer();
     const stdin = std.io.getStdIn().reader();
 
-    if (args.len < 2) {
+    if (res.args.help != 0) {
+        return clap.usage(std.io.getStdErr().writer(), clap.Help, &params);
+    } else if (res.positionals.len > 0) {
+        const MAX_PROGRAM = 0xffff_ffff;
+        const data = if (std.mem.eql(u8, res.positionals[0], "-")) out: {
+            break :out try stdin.readAllAlloc(alloc, MAX_PROGRAM);
+        } else out: {
+            const fp = try std.fs.cwd().openFile(res.positionals[0], .{});
+            defer fp.close();
+
+            break :out try fp.readToEndAlloc(alloc, MAX_PROGRAM);
+        };
+
+        defer alloc.free(data);
+        if (res.args.nobytecode != 0) {
+            var vm = Interpreter.new();
+            vm.load(data[0..]);
+            return vm.run_to_end(&stdout, &stdin, res.args.debug != 0);
+        } else {
+            const code = try bc.compile(data, alloc);
+            defer code.deinit();
+
+            if (res.args.print != 0) {
+                bc.dump_all(code.items);
+                std.debug.print("\n\n", .{});
+            } else {
+                var vm = bc.Interpreter.new();
+                vm.load(code.items[0..]);
+                return vm.run_to_end(&stdout, &stdin, res.args.debug != 0);
+            }
+        }
+    } else {
         return repl(&stdout, &stdin);
     }
-
-    const fp = try std.fs.cwd().openFile(args[1], .{});
-    defer fp.close();
-
-    const data = try fp.readToEndAlloc(alloc, 0xffff_ffff);
-    defer alloc.free(data);
-
-    // var vm = Interpreter.new();
-    // vm.load(data[0..]);
-    // return vm.run_to_end(&stdout, &stdin, false);
-
-    const code = try bc.compile(data, alloc);
-    defer code.deinit();
-
-    // bc.dump_all(code.items);
-    // std.debug.print("\n\n", .{});
-
-    var vm = bc.Interpreter.new();
-    vm.load(code.items[0..]);
-    return vm.run_to_end(&stdout, &stdin, true);
 }
