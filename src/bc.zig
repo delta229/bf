@@ -1,5 +1,4 @@
 const std = @import("std");
-const vm = @import("./state.zig");
 const ArrayList = std.ArrayList;
 
 const Opcode = enum(u8) {
@@ -13,9 +12,6 @@ const Opcode = enum(u8) {
     jz, // u32 operand
     jnz, // u32 operand
 };
-
-const InterpretError = error{CorruptedBytecode};
-const StepError = error{Halt} || InterpretError || anyerror; //InterpretError || std.fs.File.WriteError || std.fs.File.ReadError;
 
 pub fn compile(program: []const u8, alloc: std.mem.Allocator) !ArrayList(u8) {
     var bc = ArrayList(u8).init(alloc);
@@ -37,7 +33,7 @@ pub fn compile(program: []const u8, alloc: std.mem.Allocator) !ArrayList(u8) {
             },
             ']' => {
                 const last = jumps.popOrNull() orelse {
-                    return vm.InterpretError.UnmatchedR;
+                    return error.UnmatchedR;
                 };
 
                 var buffer: [4]u8 = undefined;
@@ -54,7 +50,7 @@ pub fn compile(program: []const u8, alloc: std.mem.Allocator) !ArrayList(u8) {
     }
 
     if (jumps.items.len > 0) {
-        return vm.InterpretError.UnmatchedL;
+        return error.UnmatchedL;
     }
 
     try bc.append(@intFromEnum(Opcode.halt));
@@ -102,72 +98,125 @@ pub fn dump_one(bc: []const u8, ip: *usize) void {
     }
 }
 
-fn step(self: *vm.State, out: anytype, in: anytype) StepError!void {
-    if (self.ip >= self.program.len) {
-        return;
+const NUM_CELLS = 65535;
+const EMPTY_PROGRAM = [_]u8{@intFromEnum(Opcode.halt)};
+
+pub const InterpretError = error{
+    OutOfBounds,
+    Halt,
+    CorruptedBytecode,
+};
+
+pub const Interpreter = struct {
+    const Self = @This();
+
+    bp: usize,
+    ip: usize,
+    data: [NUM_CELLS]u8,
+    program: []const u8,
+
+    pub fn new() Self {
+        var self: Self = undefined;
+        self.reset();
+        return self;
     }
 
-    const opcode = std.meta.intToEnum(Opcode, self.program[self.ip]) catch {
-        return InterpretError.CorruptedBytecode;
-    };
-
-    self.ip += 1;
-    switch (opcode) {
-        .right => self.bp += 1,
-        .left => self.bp -= 1,
-        .inc => self.data[self.bp] +%= 1,
-        .dec => self.data[self.bp] -%= 1,
-        .out => try out.print("{c}", .{self.data[self.bp]}),
-        .in => self.data[self.bp] = in.readByte() catch 0, // EOF = 0, other options are -1 or do nothing
-        .jz => {
-            if (self.data[self.bp] == 0) {
-                self.ip = std.mem.readInt(u32, self.program[self.ip..][0..4], .little);
-            } else {
-                self.ip += 4;
-            }
-        },
-        .jnz => {
-            if (self.data[self.bp] != 0) {
-                self.ip = std.mem.readInt(u32, self.program[self.ip..][0..4], .little);
-            } else {
-                self.ip += 4;
-            }
-        },
-        .halt => return vm.InterpretError.Halt,
+    pub fn load(self: *Self, program: []const u8) void {
+        self.program = program;
+        self.ip = 0;
     }
-}
 
-fn dump(self: *const vm.State) void {
-    var ip = self.ip;
-    dump_one(self.program, &ip);
-    std.debug.print("\t\t | BP: 0x{x:0>4} [ ", .{self.bp});
+    pub fn reset(self: *Self) void {
+        self.load(&EMPTY_PROGRAM);
+        self.bp = 0;
+        @memset(&self.data, 0);
+    }
 
-    const RANGE = 5;
-    const min = self.bp -| RANGE;
-    for (self.data[min .. self.bp + RANGE + 1], min..) |byte, i| {
-        if (i == self.bp) {
-            std.debug.print("\x1b[31;1;4m0x{x:0>2}\x1b[0m ", .{byte});
-        } else {
-            std.debug.print("0x{x:0>2} ", .{byte});
+    pub fn run_for(self: *Self, count: ?usize, out: anytype, in: anytype, dbg: bool) !void {
+        var exec: usize = 0;
+        while (self.ip < self.program.len and (count == null or exec < count.?)) : (exec +|= 1) {
+            if (dbg) {
+                self.dump();
+            }
+            self.step(out, in) catch |err| {
+                if (err == InterpretError.Halt) {
+                    break;
+                }
+
+                return err;
+            };
         }
     }
-    std.debug.print("]\n", .{});
-}
 
-pub const Interpreter = vm.Interpreter(StepError, &[_]u8{@intFromEnum(Opcode.halt)}, step, dump);
+    pub fn run_to_end(self: *Self, out: anytype, in: anytype, dbg: bool) !void {
+        return self.run_for(null, out, in, dbg);
+    }
+
+    pub fn step(self: *Self, out: anytype, in: anytype) !void {
+        if (self.ip >= self.program.len) {
+            return;
+        }
+
+        const opcode = std.meta.intToEnum(Opcode, self.program[self.ip]) catch {
+            return InterpretError.CorruptedBytecode;
+        };
+
+        self.ip += 1;
+        switch (opcode) {
+            .right => self.bp += 1,
+            .left => self.bp -= 1,
+            .inc => self.data[self.bp] +%= 1,
+            .dec => self.data[self.bp] -%= 1,
+            .out => try out.print("{c}", .{self.data[self.bp]}),
+            .in => self.data[self.bp] = in.readByte() catch 0, // EOF = 0, other options are -1 or do nothing
+            .jz => {
+                if (self.data[self.bp] == 0) {
+                    self.ip = std.mem.readInt(u32, self.program[self.ip..][0..4], .little);
+                } else {
+                    self.ip += 4;
+                }
+            },
+            .jnz => {
+                if (self.data[self.bp] != 0) {
+                    self.ip = std.mem.readInt(u32, self.program[self.ip..][0..4], .little);
+                } else {
+                    self.ip += 4;
+                }
+            },
+            .halt => return InterpretError.Halt,
+        }
+    }
+
+    pub fn dump(self: *const Self) void {
+        var ip = self.ip;
+        dump_one(self.program, &ip);
+        std.debug.print("\t\t | BP: 0x{x:0>4} [ ", .{self.bp});
+
+        const RANGE = 5;
+        const min = self.bp -| RANGE;
+        for (self.data[min .. self.bp + RANGE + 1], min..) |byte, i| {
+            if (i == self.bp) {
+                std.debug.print("\x1b[31;1;4m0x{x:0>2}\x1b[0m ", .{byte});
+            } else {
+                std.debug.print("0x{x:0>2} ", .{byte});
+            }
+        }
+        std.debug.print("]\n", .{});
+    }
+};
 
 fn expectOutput(program: []const u8, expected: []const u8) !void {
     const buf = try compile(program, std.testing.allocator);
     defer buf.deinit();
 
-    var interpreter = Interpreter.new();
-    interpreter.load(buf.items);
+    var vm = Interpreter.new();
+    vm.load(buf.items);
 
     var arr = std.ArrayList(u8).init(std.testing.allocator);
     defer arr.deinit();
 
     const stdin = std.io.getStdIn().reader(); // TODO: some kind of "empty" reader
-    try interpreter.run_to_end(&arr.writer(), &stdin, false);
+    try vm.run_to_end(&arr.writer(), &stdin, false);
 
     try std.testing.expectEqualStrings(expected, arr.items);
 }

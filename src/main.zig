@@ -1,17 +1,20 @@
 const std = @import("std");
 const clap = @import("clap");
-const Interpreter = @import("./interpreter.zig").Interpreter;
 const bc = @import("./bc.zig");
+const Allocator = std.mem.Allocator;
 
-fn repl(out: *const std.fs.File.Writer, in: *const std.fs.File.Reader) !void {
+fn repl(alloc: Allocator, out: *const std.fs.File.Writer, in: *const std.fs.File.Reader) !void {
+    var code = try bc.compile("", alloc);
+    defer code.deinit();
+
     var buffer: [2048]u8 = undefined;
-    var vm = Interpreter.new();
+    var vm = bc.Interpreter.new();
     var debug = false;
-    var line_by_line = false;
+    var id = false;
     while (true) {
         std.debug.print(">> ", .{});
 
-        const Command = enum { quit, reset, dump, debug, line_by_line };
+        const Command = enum { quit, reset, dump, debug, id };
         const command = in.readUntilDelimiter(&buffer, '\n') catch |err| {
             if (err == error.EndOfStream) {
                 return;
@@ -22,11 +25,14 @@ fn repl(out: *const std.fs.File.Writer, in: *const std.fs.File.Reader) !void {
         };
 
         const cmd = std.meta.stringToEnum(Command, command) orelse {
-            vm.load(command);
-            vm.run_to_end(out, in, debug and line_by_line) catch |err| {
+            code.deinit();
+            code = try bc.compile(command, alloc);
+
+            vm.load(code.items);
+            vm.run_to_end(out, in, debug and id) catch |err| {
                 std.debug.print("\nError: '{}'\n", .{err});
             };
-            if (debug and !line_by_line) {
+            if (debug and !id) {
                 vm.dump();
             }
             continue;
@@ -37,11 +43,11 @@ fn repl(out: *const std.fs.File.Writer, in: *const std.fs.File.Reader) !void {
             .dump => vm.dump(),
             .debug => {
                 debug = !debug;
-                std.debug.print("Debug mode is {s}\n", .{if (debug) "enabled" else "disabled" });
+                std.debug.print("Debug mode is {s}\n", .{if (debug) "enabled" else "disabled"});
             },
-            .line_by_line => {
-                line_by_line = !line_by_line;
-                std.debug.print("Line-by-line mode is {s}\n", .{if (debug) "enabled" else "disabled" });
+            .id => {
+                id = !id;
+                std.debug.print("Instruction dump mode is {s}\n", .{if (debug) "enabled" else "disabled"});
             },
         }
     }
@@ -54,7 +60,6 @@ pub fn main() !void {
     const alloc = gpa.allocator();
     const params = comptime clap.parseParamsComptime(
         \\-h, --help             Display this help and exit.
-        \\-n, --nobytecode       Don't use the bytecode interpreter.
         \\-d, --debug            Enable instruction debug mode.
         \\-p, --print            Dump bytecode instead of executing.
         \\<str>...
@@ -87,26 +92,20 @@ pub fn main() !void {
 
             break :out try fp.readToEndAlloc(alloc, MAX_PROGRAM);
         };
-
         defer alloc.free(data);
-        if (res.args.nobytecode != 0) {
-            var vm = Interpreter.new();
-            vm.load(data[0..]);
-            return vm.run_to_end(&stdout, &stdin, res.args.debug != 0);
-        } else {
-            const code = try bc.compile(data, alloc);
-            defer code.deinit();
 
-            if (res.args.print != 0) {
-                bc.dump_all(code.items);
-                std.debug.print("\n\n", .{});
-            } else {
-                var vm = bc.Interpreter.new();
-                vm.load(code.items[0..]);
-                return vm.run_to_end(&stdout, &stdin, res.args.debug != 0);
-            }
+        const code = try bc.compile(data, alloc);
+        defer code.deinit();
+
+        if (res.args.print != 0) {
+            bc.dump_all(code.items);
+            std.debug.print("\n\n", .{});
+        } else {
+            var vm = bc.Interpreter.new();
+            vm.load(code.items[0..]);
+            return vm.run_to_end(&stdout, &stdin, res.args.debug != 0);
         }
     } else {
-        return repl(&stdout, &stdin);
+        return repl(alloc, &stdout, &stdin);
     }
 }
